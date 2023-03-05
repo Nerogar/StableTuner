@@ -1055,6 +1055,8 @@ def main():
                         #shutil.rmtree(oldest_folder_path)
             # Create the pipeline using using the trained modules and save it.
             if accelerator.is_main_process:
+                if args.use_ema == True:
+                    ema_unet.to(device="cpu")
                 if 'step' in context:
                     #what is the current epoch
                     epoch = step // num_update_steps_per_epoch
@@ -1229,6 +1231,8 @@ def main():
                 elif save_model == False and len(imgs) > 0:
                     del imgs
                     print(f"{bcolors.OKGREEN}Samples saved to {sample_dir}{bcolors.ENDC}")
+                if args.use_ema == True:
+                    ema_unet.to(device=accelerator.device)
         except Exception as e:
             print(e)
             print(f"{bcolors.FAIL} Error occured during sampling, skipping.{bcolors.ENDC}")
@@ -1380,9 +1384,9 @@ def main():
                         latent_dist = batch[0][0]
                         latents = latent_dist.sample() * 0.18215
                         
+                        mask = batch[0][2]
+                        mask_mean = batch[0][3]
                         if args.model_variant == 'inpainting':
-                            mask = batch[0][2]
-                            mask_mean = batch[0][3]
                             conditioning_latent_dist = batch[0][4]
                             conditioning_latents = conditioning_latent_dist.sample() * 0.18215
                         if args.model_variant == 'depth2img':
@@ -1419,12 +1423,11 @@ def main():
 
                     
                     # Predict the noise residual
-                    mask=None
+                    if mask is not None and random.uniform(0, 1) < args.unmasked_probability:
+                        # for some steps, predict the unmasked image
+                        conditioning_latents = torch.stack([full_mask_by_aspect[tuple([latents.shape[3]*8, latents.shape[2]*8])].squeeze()] * bsz)
+                        mask = torch.ones(bsz, 1, latents.shape[2], latents.shape[3]).to(accelerator.device, dtype=weight_dtype)
                     if args.model_variant == 'inpainting':
-                        if mask is not None and random.uniform(0, 1) < args.unmasked_probability:
-                            # for some steps, predict the unmasked image
-                            conditioning_latents = torch.stack([full_mask_by_aspect[tuple([latents.shape[3]*8, latents.shape[2]*8])].squeeze()] * bsz)
-                            mask = torch.ones(bsz, 1, latents.shape[2], latents.shape[3]).to(accelerator.device, dtype=weight_dtype)
                         noisy_inpaint_latents = torch.concat([noisy_latents, mask, conditioning_latents], 1)
                         model_pred = unet(noisy_inpaint_latents, timesteps, encoder_hidden_states).sample
                     elif args.model_variant == 'depth2img':
