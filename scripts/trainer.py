@@ -34,15 +34,16 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel,DiffusionPipeline, DPMSolverMultistepScheduler,EulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
+from src.transformers.src.transformers import DPTImageProcessor, DPTForDepthEstimation
 from torchvision.transforms import functional
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from typing import Dict, List, Generator, Tuple
 from PIL import Image, ImageFile
 from diffusers.utils.import_utils import is_xformers_available
-from trainer_util import *
 from dataloaders_util import *
 from lion_pytorch import Lion
+
 logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -509,11 +510,18 @@ def main():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
     # Load the tokenizer
+    tokenizer = None
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name )
     elif args.pretrained_model_name_or_path:
         #print(os.getcwd())
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer" )
+
+    image_depth_processor = None
+    depth_estimator = None
+    if args.model_variant == "depth2img":
+        image_depth_processor = DPTImageProcessor.from_pretrained(args.pretrained_model_name_or_path, subfolder='feature_extractor')
+        depth_estimator = DPTForDepthEstimation.from_pretrained(args.pretrained_model_name_or_path, subfolder='depth_estimator').to(accelerator.device)
 
     # Load models and create wrapper for stable diffusion
     #text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder" )
@@ -608,135 +616,6 @@ def main():
         )
     noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    if args.use_bucketing:
-        train_dataset = AutoBucketing(
-            concepts_list=args.concepts_list,
-            use_image_names_as_captions=args.use_image_names_as_captions,
-            batch_size=args.train_batch_size,
-            tokenizer=tokenizer,
-            add_class_images_to_dataset=args.add_class_images_to_dataset,
-            balance_datasets=args.auto_balance_concept_datasets,
-            resolution=args.resolution,
-            with_prior_loss=False,#args.with_prior_preservation,
-            repeats=args.dataset_repeats,
-            use_text_files_as_captions=args.use_text_files_as_captions,
-            aspect_mode=args.aspect_mode,
-            action_preference=args.aspect_mode_action_preference,
-            seed=args.seed,
-            model_variant=args.model_variant,
-            extra_module=None if args.model_variant != "depth2img" else d2i,
-            mask_prompts=args.mask_prompts,
-            load_mask=args.masked_training,
-        )
-    else:
-        train_dataset = NormalDataset(
-        concepts_list=args.concepts_list,
-        tokenizer=tokenizer,
-        with_prior_preservation=args.with_prior_preservation,
-        size=args.resolution,
-        center_crop=args.center_crop,
-        num_class_images=args.num_class_images,
-        use_image_names_as_captions=args.use_image_names_as_captions,
-        repeats=args.dataset_repeats,
-        use_text_files_as_captions=args.use_text_files_as_captions,
-        seed = args.seed,
-        model_variant=args.model_variant,
-        extra_module=None if args.model_variant != "depth2img" else d2i,
-        mask_prompts=args.mask_prompts,
-        load_mask=args.masked_training,
-    )
-    def collate_fn(examples):
-        #print(examples)
-        #print('test')
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        tokens = input_ids
-        pixel_values = [example["instance_images"] for example in examples]
-        mask = None
-        if "mask" in examples[0]:
-            mask = [example["mask"] for example in examples]
-        if args.model_variant == 'depth2img':
-            depth = [example["instance_depth_images"] for example in examples]
-
-        #print('test')
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            if "mask" in examples[0]:
-                mask += [example["class_mask"] for example in examples]
-            if args.model_variant == 'depth2img':
-                depth = [example["class_depth_images"] for example in examples]
-        mask_values = None
-        if mask is not None:
-            mask_values = torch.stack(mask)
-            mask_values = mask_values.to(memory_format=torch.contiguous_format).float()
-        if args.model_variant == 'depth2img':
-            depth_values = torch.stack(depth)
-            depth_values = depth_values.to(memory_format=torch.contiguous_format).float()
-        ### no need to do it now when it's loaded by the multiAspectsDataset
-        #if args.with_prior_preservation:
-        #    input_ids += [example["class_prompt_ids"] for example in examples]
-        #    pixel_values += [example["class_images"] for example in examples]
-        
-        #print(pixel_values)
-        #unpack the pixel_values from tensor to list
-
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",\
-            ).input_ids
-
-        extra_values = None
-        if args.model_variant == 'depth2img':
-            extra_values = depth_values
-
-        return {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "extra_values": extra_values,
-            "mask_values": mask_values,
-            "tokens": tokens
-        }
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=True
-    )
-    #get the length of the dataset
-    train_dataset_length = len(train_dataset)
-    #code to check if latent cache needs to be resaved
-    #check if last_run.json file exists in logging_dir
-    if os.path.exists(logging_dir / "last_run.json"):
-        #if it exists, load it
-        with open(logging_dir / "last_run.json", "r") as f:
-            last_run = json.load(f)
-            last_run_batch_size = last_run["batch_size"]
-            last_run_dataset_length = last_run["dataset_length"]
-            if last_run_batch_size != args.train_batch_size:
-                print(f" {bcolors.WARNING}The batch_size has changed since the last run. Regenerating Latent Cache.{bcolors.ENDC}") 
-
-                args.regenerate_latent_cache = True
-                #save the new batch_size and dataset_length to last_run.json
-            if last_run_dataset_length != train_dataset_length:
-                print(f" {bcolors.WARNING}The dataset length has changed since the last run. Regenerating Latent Cache.{bcolors.ENDC}") 
-
-                args.regenerate_latent_cache = True
-                #save the new batch_size and dataset_length to last_run.json
-        with open(logging_dir / "last_run.json", "w") as f:
-            json.dump({"batch_size": args.train_batch_size, "dataset_length": train_dataset_length}, f)
-                
-    else:
-        #if it doesn't exist, create it
-        last_run = {"batch_size": args.train_batch_size, "dataset_length": train_dataset_length}
-        #create the file
-        with open(logging_dir / "last_run.json", "w") as f:
-            json.dump(last_run, f)
-
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         print("Using fp16")
@@ -757,100 +636,16 @@ def main():
     if not args.train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
 
-    if args.use_bucketing:
-        wh = set([tuple(x.target_wh) for x in train_dataset.image_train_items])
-    else:
-        wh = set([tuple([args.resolution, args.resolution]) for x in train_dataset.image_paths])
-    full_mask_by_aspect = {shape: vae.encode(torch.zeros(1, 3, shape[1], shape[0]).to(accelerator.device, dtype=weight_dtype)).latent_dist.mean * 0.18215 for shape in wh}
+    latent_cache_dir = os.path.join(args.output_dir, "logs", "latent_cache")
+    ds = create_dataset(
+        model_variant=args.model_variant, concepts=args.concepts_list, cache_dir=latent_cache_dir, batch_size=args.train_batch_size, device=accelerator.device,
+        vae=vae, tokenizer=tokenizer, image_depth_processor=image_depth_processor, depth_estimator=depth_estimator
+    )
+    dl = TrainDataLoader(ds, batch_size=args.train_batch_size)
 
-    cached_dataset = CachedLatentsDataset(batch_size=args.train_batch_size,
-    text_encoder=text_encoder,
-    tokenizer=tokenizer,
-    dtype=weight_dtype,
-    model_variant=args.model_variant,
-    shuffle_per_epoch=args.shuffle_per_epoch,
-    args = args,)
-
-    gen_cache = False
-    data_len = len(train_dataloader)
-    latent_cache_dir = Path(args.output_dir, "logs", "latent_cache")
-    #check if latents_cache.pt exists in the output_dir
-    if not os.path.exists(latent_cache_dir):
-        os.makedirs(latent_cache_dir)
-    for i in range(0,data_len-1):
-        if not os.path.exists(os.path.join(latent_cache_dir, f"latents_cache_{i}.pt")):
-            gen_cache = True
-            break
-    if args.regenerate_latent_cache == True:
-            files = os.listdir(latent_cache_dir)
-            gen_cache = True
-            for file in files:
-                os.remove(os.path.join(latent_cache_dir,file))
-    if gen_cache == False :
-        print(f" {bcolors.OKGREEN}Loading Latent Cache from {latent_cache_dir}{bcolors.ENDC}")
-        del vae
-        if not args.train_text_encoder:
-            del text_encoder
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        #load all the cached latents into a single dataset
-        for i in range(0,data_len-1):
-            cached_dataset.add_pt_cache(os.path.join(latent_cache_dir,f"latents_cache_{i}.pt"))
-    if gen_cache == True:
-        #delete all the cached latents if they exist to avoid problems
-        print(f" {bcolors.WARNING}Generating latents cache...{bcolors.ENDC}")
-        train_dataset = LatentsDataset([], [], [], [], [], [])
-        counter = 0
-        ImageFile.LOAD_TRUNCATED_IMAGES = True
-        with torch.no_grad():
-            for batch in tqdm(train_dataloader, desc="Caching latents", bar_format='%s{l_bar}%s%s{bar}%s%s{r_bar}%s'%(bcolors.OKBLUE,bcolors.ENDC, bcolors.OKBLUE, bcolors.ENDC,bcolors.OKBLUE,bcolors.ENDC,)):
-                cached_extra = None
-                cached_mask = None
-                batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
-                cached_latent = vae.encode(batch["pixel_values"]).latent_dist
-                if batch["mask_values"] is not None:
-                    cached_mask = functional.resize(batch["mask_values"], size=cached_latent.mean.shape[2:])
-                if batch["mask_values"] is not None and args.model_variant == "inpainting":
-                    batch["mask_values"] = batch["mask_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                    cached_extra = vae.encode(batch["pixel_values"] * (1 - batch["mask_values"])).latent_dist
-                if args.model_variant == "depth2img":
-                    batch["extra_values"] = batch["extra_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                    cached_extra = functional.resize(batch["extra_values"], size=cached_latent.mean.shape[2:])
-                if args.train_text_encoder:
-                    cached_text_enc = batch["input_ids"]
-                else:
-                    cached_text_enc = text_encoder(batch["input_ids"])[0]
-                train_dataset.add_latent(cached_latent, cached_text_enc, cached_mask, cached_extra, batch["tokens"])
-                del batch
-                del cached_latent
-                del cached_text_enc
-                del cached_mask
-                del cached_extra
-                torch.save(train_dataset, os.path.join(latent_cache_dir,f"latents_cache_{counter}.pt"))
-                cached_dataset.add_pt_cache(os.path.join(latent_cache_dir,f"latents_cache_{counter}.pt"))
-                counter += 1
-                train_dataset = LatentsDataset([], [], [], [], [], [])
-                #if counter % 300 == 0:
-                    #train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=False)
-                #    gc.collect()
-                #    torch.cuda.empty_cache()
-                #    accelerator.free_memory()
-
-        #clear vram after caching latents
-        del vae
-        if not args.train_text_encoder:
-            del text_encoder
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        #load all the cached latents into a single dataset
-    train_dataloader = torch.utils.data.DataLoader(cached_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=False)
-    print(f" {bcolors.OKGREEN}Latents are ready.{bcolors.ENDC}")
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = len(train_dataloader)
+    num_update_steps_per_epoch = len(dl)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -866,24 +661,24 @@ def main():
     )
 
     if args.train_text_encoder and not args.use_ema:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        unet, text_encoder, optimizer, dl, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, optimizer, dl, lr_scheduler
         )
     elif args.train_text_encoder and args.use_ema:
-        unet, text_encoder, ema_unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, ema_unet, optimizer, train_dataloader, lr_scheduler
+        unet, text_encoder, ema_unet, optimizer, dl, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, ema_unet, optimizer, dl, lr_scheduler
         )
     elif not args.train_text_encoder and args.use_ema:
-        unet, ema_unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, ema_unet, optimizer, train_dataloader, lr_scheduler
+        unet, ema_unet, optimizer, dl, lr_scheduler = accelerator.prepare(
+            unet, ema_unet, optimizer, dl, lr_scheduler
         )
     elif not args.train_text_encoder and not args.use_ema:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        unet, optimizer, dl, lr_scheduler = accelerator.prepare(
+            unet, optimizer, dl, lr_scheduler
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = len(train_dataloader)
+    num_update_steps_per_epoch = len(dl)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         #print(args.max_train_steps, num_update_steps_per_epoch)
@@ -899,8 +694,8 @@ def main():
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num examples = {len(ds)}")
+    logger.info(f"  Num batches each epoch = {len(dl)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1376,23 +1171,19 @@ def main():
                     args.stop_text_encoder_training = epoch
             progress_bar_inter_epoch.set_description("Steps To Epoch")
             progress_bar_inter_epoch.reset(total=num_update_steps_per_epoch)
-            for step, batch in enumerate(train_dataloader):
+            for step, batch in enumerate(dl):
                 with accelerator.accumulate(unet):
-                    # Convert images to latent space
                     with torch.no_grad():
-
-                        latent_dist = batch[0][0]
-                        latents = latent_dist.sample() * 0.18215
-                        
-                        mask = batch[0][2]
-                        mask_mean = batch[0][3]
-                        if args.model_variant == 'inpainting':
-                            conditioning_latent_dist = batch[0][4]
-                            conditioning_latents = conditioning_latent_dist.sample() * 0.18215
+                        tokens = batch['tokens']
+                        latents = batch['latent_image'] * 0.18215
+                        mask = batch['latent_mask']
+                        mask_mean = mask.mean(dim=(1, 2, 3))
+                        conditioning_latents = batch['latent_conditioning_image'] * 0.18215
                         if args.model_variant == 'depth2img':
-                            depth = batch[0][4]
+                            depth = batch['latent_depth']
                     if args.sample_from_batch > 0:
-                        args.batch_tokens = batch[0][5]
+                        args.batch_tokens = tokens
+
                     # Sample noise that we'll add to the latents
                     # and some extra bits to make it so that the model learns to change the zero-frequency of the component freely
                     # https://www.crosslabs.org/blog/diffusion-with-offset-noise
@@ -1414,19 +1205,20 @@ def main():
                     with text_enc_context:
                         if args.train_text_encoder:
                             if args.clip_penultimate == True:
-                                encoder_hidden_states = text_encoder(batch[0][1],output_hidden_states=True)
+                                encoder_hidden_states = text_encoder(tokens,output_hidden_states=True)
                                 encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states['hidden_states'][-2])
                             else:
-                                encoder_hidden_states = text_encoder(batch[0][1])[0]
+                                encoder_hidden_states = text_encoder(tokens)[0]
                         else:
-                            encoder_hidden_states = batch[0][1]
+                            encoder_hidden_states = tokens
 
                     
                     # Predict the noise residual
-                    if mask is not None and random.uniform(0, 1) < args.unmasked_probability:
-                        # for some steps, predict the unmasked image
-                        conditioning_latents = torch.stack([full_mask_by_aspect[tuple([latents.shape[3]*8, latents.shape[2]*8])].squeeze()] * bsz)
-                        mask = torch.ones(bsz, 1, latents.shape[2], latents.shape[3]).to(accelerator.device, dtype=weight_dtype)
+                    # TODO
+                    #if mask is not None and random.uniform(0, 1) < args.unmasked_probability:
+                    #    # for some steps, predict the unmasked image
+                    #    conditioning_latents = torch.stack([full_mask_by_aspect[tuple([latents.shape[3]*8, latents.shape[2]*8])].squeeze()] * bsz)
+                    #    mask = torch.ones(bsz, 1, latents.shape[2], latents.shape[3]).to(accelerator.device, dtype=weight_dtype)
                     if args.model_variant == 'inpainting':
                         noisy_inpaint_latents = torch.concat([noisy_latents, mask, conditioning_latents], 1)
                         model_pred = unet(noisy_inpaint_latents, timesteps, encoder_hidden_states).sample
@@ -1466,24 +1258,28 @@ def main():
                             loss = masked_mse_loss(model_pred.float(), target.float(), mask, reduction="none").mean([1, 2, 3]).mean()
                             prior_loss = masked_mse_loss(model_pred_prior.float(), target_prior.float(), mask, reduction="mean")
                         else:
-                            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
+                            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3])
                             prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+
+                        if mask is not None and args.normalize_masked_area_loss:
+                            loss = (loss / mask_mean).mean()
+                        else:
+                            loss = loss.mean()
 
                         # Add the prior loss to the instance loss.
                         loss = loss + args.prior_loss_weight * prior_loss
 
-                        if mask is not None and args.normalize_masked_area_loss:
-                            loss = loss / mask_mean
-
                     else:
                         if mask is not None and args.model_variant != "inpainting":
                             loss = masked_mse_loss(model_pred.float(), target.float(), mask, reduction="none").mean([1, 2, 3])
-                            loss = loss.mean()
                         else:
-                            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3])
 
                         if mask is not None and args.normalize_masked_area_loss:
-                            loss = loss / mask_mean
+                            loss = (loss / mask_mean).mean()
+                        else:
+                            loss = loss.mean()
+
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         params_to_clip = (
